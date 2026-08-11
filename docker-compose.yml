@@ -1,0 +1,16 @@
+services:
+  airtag_tracker:
+    image: ghcr.io/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME:latest
+    container_name: airtag_tracker
+    restart: always
+    volumes:
+      # Single named Docker volume holds everything: config.yaml,
+      # records/ (your two plist files), and all persistent state
+      # (saved Apple session, last-poll timestamp). You'll create
+      # config.yaml and copy the plist files in via Portainer's
+      # Console, the same way you'll do the one-time 2FA login --
+      # no filesystem/SSH access to any host needed.
+      - airtag_data:/app/data
+
+volumes:
+  airtag_data:

@@ -1,0 +1,24 @@
+# Add this to Home Assistant's configuration.yaml (or a packages/ include),
+# then restart HA (or Developer Tools -> YAML -> Reload MQTT if that's
+# enough for your setup).
+#
+# Note: this is adapted from the original ha_findmy_mqtt README example --
+# I removed the BLE-specific parts (state_topic, the second availability
+# topic, availability_mode) since we're only running the GPS tracker
+# script, not the Bluetooth scanner. source_type: gps lets HA derive
+# home/away/zone status directly from the lat/long in json_attributes_topic
+# without needing a separate state topic.
+
+mqtt:
+  - device_tracker:
+      name: "Ryleys Backpack"          # rename once you confirm which UUID is which
+      unique_id: airtag_1
+      json_attributes_topic: "airtag_1/attributes"
+      availability_topic: "airtag_1_gps/availability"
+      source_type: "gps"
+  - device_tracker:
+      name: "Myleys BPPS"              # rename once you confirm which UUID is which
+      unique_id: airtag_2
+      json_attributes_topic: "airtag_2/attributes"
+      availability_topic: "airtag_2_gps/availability"
+      source_type: "gps"
