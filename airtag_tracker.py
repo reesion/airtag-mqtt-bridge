@@ -15,6 +15,18 @@ logging.basicConfig(level=logging.DEBUG)
 
 LAST_UPDATE_FILE = "last_update.json"
 
+# Apple doesn't expose an exact battery percentage for AirTags over the
+# Find My cloud network (the official app doesn't show one either) -- only
+# a coarse 2-bit level packed into the top of the status byte carried by
+# every location report. This is the same status byte / bit layout the
+# findmy library's Bluetooth scanner module decodes locally, so it works
+# just as well on cloud-fetched reports.
+BATTERY_LEVELS = {0b00: "Full", 0b01: "Medium", 0b10: "Low", 0b11: "Very Low"}
+
+def get_battery_level(status: int) -> str:
+    battery_id = (status >> 6) & 0b11
+    return BATTERY_LEVELS.get(battery_id, "Unknown")
+
 def get_location_report(plist_path: str, anisette_server: str):
     try:
         with Path(plist_path).open("rb") as f:
@@ -67,6 +79,19 @@ def publish_discovery_config(client, ha_mqtt_id, name):
     client.publish(discovery_topic, json.dumps(payload), retain=True)
     logging.info("Published discovery config for %s to %s", ha_mqtt_id, discovery_topic)
 
+def publish_battery_discovery_config(client, ha_mqtt_id, name):
+    discovery_topic = f"homeassistant/sensor/{ha_mqtt_id}_battery/config"
+    payload = {
+        "name": f"{name} Battery",
+        "unique_id": f"{ha_mqtt_id}_battery",
+        "object_id": f"{ha_mqtt_id}_battery",
+        "state_topic": f"{ha_mqtt_id}/battery",
+        "availability_topic": f"{ha_mqtt_id}_gps/availability",
+        "icon": "mdi:battery",
+    }
+    client.publish(discovery_topic, json.dumps(payload), retain=True)
+    logging.info("Published battery discovery config for %s to %s", ha_mqtt_id, discovery_topic)
+
 def load_last_update_time():
     if Path(LAST_UPDATE_FILE).exists():
         with open(LAST_UPDATE_FILE, "r") as f:
@@ -111,6 +136,7 @@ def main(config_path: str) -> int:
         ha_mqtt_id = airtag["ha_mqtt_id"]
         name = airtag.get("name", ha_mqtt_id)
         publish_discovery_config(client, ha_mqtt_id, name)
+        publish_battery_discovery_config(client, ha_mqtt_id, name)
     client.loop_stop()
     client.disconnect()
 
@@ -128,6 +154,7 @@ def main(config_path: str) -> int:
             ha_mqtt_id = airtag["ha_mqtt_id"]
             mqtt_topic = f"{ha_mqtt_id}/attributes"
             mqtt_availability_topic = f"{ha_mqtt_id}_gps/availability"
+            mqtt_battery_topic = f"{ha_mqtt_id}/battery"
 
             report = get_location_report(plist_path, anisette_server)
             client.connect(mqtt_broker, mqtt_port, 60)
@@ -135,6 +162,11 @@ def main(config_path: str) -> int:
             if report:
                 publish_location(client, mqtt_topic, report)
                 publish_state(client, mqtt_availability_topic, "online")
+                try:
+                    battery_level = get_battery_level(report.status)
+                    publish_state(client, mqtt_battery_topic, battery_level)
+                except Exception as e:
+                    logging.warning("Could not determine battery level for %s: %s", ha_mqtt_id, str(e))
             else:
                 publish_state(client, mqtt_availability_topic, "offline")
             client.loop_stop()
