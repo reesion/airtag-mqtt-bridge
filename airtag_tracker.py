@@ -57,15 +57,10 @@ def publish_discovery_config(client, ha_mqtt_id, name):
     payload = {
         "name": name,
         "unique_id": ha_mqtt_id,
+        "object_id": ha_mqtt_id,
         "json_attributes_topic": f"{ha_mqtt_id}/attributes",
         "availability_topic": f"{ha_mqtt_id}_gps/availability",
         "source_type": "gps",
-        "device": {
-            "identifiers": [f"{ha_mqtt_id}_device"],
-            "name": name,
-            "manufacturer": "Apple",
-            "model": "AirTag",
-        },
     }
     client.publish(discovery_topic, json.dumps(payload), retain=True)
     logging.info("Published discovery config for %s to %s", ha_mqtt_id, discovery_topic)
