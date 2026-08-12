@@ -45,11 +45,13 @@ def publish_location(client, topic, report):
         "last_report_time": report.timestamp,
         "broadcast_time": datetime.now()
     }
-    client.publish(topic, json.dumps(location, default=str))
+    info = client.publish(topic, json.dumps(location, default=str))
+    info.wait_for_publish()
     logging.info("Location report published to %s: %s", topic, location)
 
 def publish_state(client, state_topic, state):
-    client.publish(state_topic, state)
+    info = client.publish(state_topic, state)
+    info.wait_for_publish()
     logging.info("Published '%s' to %s", state, state_topic)
 
 def publish_discovery_config(client, ha_mqtt_id, name):
@@ -104,10 +106,12 @@ def main(config_path: str) -> int:
     # Assistant creates/updates the device_tracker entities automatically --
     # no configuration.yaml edits needed on the HA side.
     client.connect(mqtt_broker, mqtt_port, 60)
+    client.loop_start()
     for airtag in airtags:
         ha_mqtt_id = airtag["ha_mqtt_id"]
         name = airtag.get("name", ha_mqtt_id)
         publish_discovery_config(client, ha_mqtt_id, name)
+    client.loop_stop()
     client.disconnect()
 
     while True:
@@ -127,11 +131,13 @@ def main(config_path: str) -> int:
 
             report = get_location_report(plist_path, anisette_server)
             client.connect(mqtt_broker, mqtt_port, 60)
+            client.loop_start()
             if report:
                 publish_location(client, mqtt_topic, report)
                 publish_state(client, mqtt_availability_topic, "online")
             else:
                 publish_state(client, mqtt_availability_topic, "offline")
+            client.loop_stop()
             client.disconnect()
 
         last_update_time = current_time
