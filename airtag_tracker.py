@@ -69,12 +69,21 @@ def publish_state(client, state_topic, state):
 def publish_discovery_config(client, ha_mqtt_id, name):
     discovery_topic = f"homeassistant/device_tracker/{ha_mqtt_id}/config"
     payload = {
-        "name": name,
+        # "name": None + a "device" block is HA's documented way to say
+        # "this entity IS the device -- don't append a name suffix".
+        # (Earlier we set this to the same string as the device name,
+        # which made HA concatenate them into "X X" -- that's the bug
+        # this avoids.)
+        "name": None,
         "unique_id": ha_mqtt_id,
         "object_id": ha_mqtt_id,
         "json_attributes_topic": f"{ha_mqtt_id}/attributes",
         "availability_topic": f"{ha_mqtt_id}_gps/availability",
         "source_type": "gps",
+        "device": {
+            "identifiers": [ha_mqtt_id],
+            "name": name,
+        },
     }
     client.publish(discovery_topic, json.dumps(payload), retain=True)
     logging.info("Published discovery config for %s to %s", ha_mqtt_id, discovery_topic)
@@ -82,12 +91,19 @@ def publish_discovery_config(client, ha_mqtt_id, name):
 def publish_battery_discovery_config(client, ha_mqtt_id, name):
     discovery_topic = f"homeassistant/sensor/{ha_mqtt_id}_battery/config"
     payload = {
-        "name": f"{name} Battery",
+        # A non-null suffix name here is intentional: HA concatenates it
+        # with the device name ("<device name> Battery"), which is the
+        # normal/expected behavior for a secondary entity on a device.
+        "name": "Battery",
         "unique_id": f"{ha_mqtt_id}_battery",
         "object_id": f"{ha_mqtt_id}_battery",
         "state_topic": f"{ha_mqtt_id}/battery",
         "availability_topic": f"{ha_mqtt_id}_gps/availability",
         "icon": "mdi:battery",
+        "device": {
+            "identifiers": [ha_mqtt_id],
+            "name": name,
+        },
     }
     client.publish(discovery_topic, json.dumps(payload), retain=True)
     logging.info("Published battery discovery config for %s to %s", ha_mqtt_id, discovery_topic)
