@@ -70,7 +70,7 @@ if __name__ == "__main__":
     import yaml
 
     logging.basicConfig(level=logging.INFO)
-    config = yaml.safe_load((Path(__file__).parent / "config.yaml").read_text())
+    config = yaml.safe_load(Path("/app/data/config.yaml").read_text())
     anisette = RemoteAnisetteProvider(config["anisette_server"])
     get_account_sync(anisette)
     print(f"Session saved to {SESSION_FILE}. You can now start the background service.")
