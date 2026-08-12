@@ -24,18 +24,14 @@ def get_location_report(plist_path: str, anisette_server: str):
         acc = get_account_sync(anisette)
 
         try:
-            end = datetime.now(tz=timezone.utc)
-            start = end - timedelta(hours=12)
-            reports = acc.fetch_reports(airtag, start, None)
+            report = acc.fetch_location(airtag)
         finally:
-            acc._evt_loop.run_until_complete(acc.close())
+            acc.close()
 
-        if reports:
-            reports = sorted(reports, key=lambda report: (report, -report.confidence))
-            latest_report = reports[-1]
-            return latest_report
+        if report:
+            return report
         else:
-            logging.warning("No location reports found for %s", plist_path)
+            logging.warning("No location report found for %s", plist_path)
             return None
     except Exception as e:
         logging.error("Error fetching location report for %s: %s", plist_path, str(e))
