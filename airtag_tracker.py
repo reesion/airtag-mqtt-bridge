@@ -3,6 +3,7 @@ import sys
 import yaml
 import json
 import argparse
+import threading
 from pathlib import Path
 import time
 import paho.mqtt.client as mqtt
@@ -58,13 +59,23 @@ def publish_location(client, topic, report):
         "broadcast_time": datetime.now()
     }
     info = client.publish(topic, json.dumps(location, default=str))
-    info.wait_for_publish()
+    _wait_for_publish(info, topic)
     logging.info("Location report published to %s: %s", topic, location)
 
 def publish_state(client, state_topic, state):
     info = client.publish(state_topic, state)
-    info.wait_for_publish()
+    _wait_for_publish(info, state_topic)
     logging.info("Published '%s' to %s", state, state_topic)
+
+def _wait_for_publish(info, topic, timeout=10):
+    # A bare wait_for_publish() with no timeout can hang forever if the
+    # connection is in a bad state when this is called (e.g. mid-reconnect)
+    # -- that would freeze the whole process, since every publish in this
+    # script blocks on this. Bound it and log instead of hanging.
+    try:
+        info.wait_for_publish(timeout=timeout)
+    except (RuntimeError, ValueError) as e:
+        logging.warning("Publish to %s may not have completed: %s", topic, e)
 
 def publish_discovery_config(client, ha_mqtt_id, name):
     discovery_topic = f"homeassistant/device_tracker/{ha_mqtt_id}/config"
@@ -169,6 +180,16 @@ def main(config_path: str) -> int:
         state["last_update_time"] = time.time()
         save_last_update_time(state["last_update_time"])
 
+    # Set (not called) by on_message, then acted on from the main thread.
+    # IMPORTANT: on_message runs on paho-mqtt's own network thread -- the
+    # same thread responsible for sending keepalive pings. Doing the
+    # AirTag fetch (several seconds of real HTTP calls per tag, to Apple
+    # and the anisette server) directly inside on_message blocks that
+    # thread long enough to miss keepalives, which gets the connection
+    # killed by the broker for "exceeded timeout". So on_message must
+    # only ever do fast, non-blocking work.
+    resync_requested = threading.Event()
+
     def on_message(client, userdata, msg):
         # Home Assistant publishes "online" to this topic every time it
         # finishes starting up (its MQTT "birth message"). Our attributes/
@@ -179,9 +200,8 @@ def main(config_path: str) -> int:
         # instead of waiting -- and instead of just replaying stale
         # retained data, which would hide a genuinely dead bridge.
         if msg.topic == "homeassistant/status" and msg.payload.decode() == "online":
-            logging.info("Home Assistant just came back online -- resyncing immediately")
-            publish_all_discovery(client)
-            poll_and_publish(client)
+            logging.info("Home Assistant just came back online -- flagging for resync")
+            resync_requested.set()
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect
@@ -190,7 +210,9 @@ def main(config_path: str) -> int:
 
     # One persistent connection for the life of the process, rather than
     # reconnecting every cycle -- needed so we can stay subscribed to
-    # homeassistant/status and react the moment HA restarts.
+    # homeassistant/status and react the moment HA restarts. paho-mqtt's
+    # own background thread (started by loop_start) handles reconnecting
+    # automatically if the connection ever drops.
     client.connect(mqtt_broker, mqtt_port, 60)
     client.loop_start()
     client.subscribe("homeassistant/status")
@@ -205,8 +227,15 @@ def main(config_path: str) -> int:
             current_time = time.time()
             sleep_time = max(0, polling_interval - (current_time - state["last_update_time"]))
 
-            logging.info("Sleeping for %d seconds", sleep_time)
-            time.sleep(sleep_time)
+            logging.info("Sleeping for up to %d seconds (or until HA restarts)", sleep_time)
+            # An interruptible sleep: wakes up immediately if on_message
+            # flags a resync, otherwise behaves like the normal timer.
+            woke_for_resync = resync_requested.wait(timeout=sleep_time)
+            resync_requested.clear()
+
+            if woke_for_resync:
+                logging.info("Resyncing after Home Assistant restart")
+                publish_all_discovery(client)
 
             poll_and_publish(client)
     finally:
