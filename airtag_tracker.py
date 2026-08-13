@@ -136,35 +136,17 @@ def main(config_path: str) -> int:
     polling_interval = config["polling_interval"] * 60
     airtags = config["airtags"]
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.on_connect = on_connect
-    client.username_pw_set(mqtt_username, mqtt_password)
-
     config_dir = Path(config_path).parent
-    last_update_time = load_last_update_time()
+    state = {"last_update_time": load_last_update_time()}
 
-    # Publish retained MQTT discovery configs once at startup so Home
-    # Assistant creates/updates the device_tracker entities automatically --
-    # no configuration.yaml edits needed on the HA side.
-    client.connect(mqtt_broker, mqtt_port, 60)
-    client.loop_start()
-    for airtag in airtags:
-        ha_mqtt_id = airtag["ha_mqtt_id"]
-        name = airtag.get("name", ha_mqtt_id)
-        publish_discovery_config(client, ha_mqtt_id, name)
-        publish_battery_discovery_config(client, ha_mqtt_id, name)
-    client.loop_stop()
-    client.disconnect()
+    def publish_all_discovery(client):
+        for airtag in airtags:
+            ha_mqtt_id = airtag["ha_mqtt_id"]
+            name = airtag.get("name", ha_mqtt_id)
+            publish_discovery_config(client, ha_mqtt_id, name)
+            publish_battery_discovery_config(client, ha_mqtt_id, name)
 
-    while True:
-        current_time = time.time()
-        sleep_time = max(0, polling_interval - (current_time - last_update_time))
-
-        logging.info("Sleeping for %d seconds", sleep_time)
-        time.sleep(sleep_time)
-
-        current_time = time.time()
-
+    def poll_and_publish(client):
         for airtag in airtags:
             plist_path = config_dir / airtag["plist_path"]
             ha_mqtt_id = airtag["ha_mqtt_id"]
@@ -173,8 +155,6 @@ def main(config_path: str) -> int:
             mqtt_battery_topic = f"{ha_mqtt_id}/battery"
 
             report = get_location_report(plist_path, anisette_server)
-            client.connect(mqtt_broker, mqtt_port, 60)
-            client.loop_start()
             if report:
                 publish_location(client, mqtt_topic, report)
                 publish_state(client, mqtt_availability_topic, "online")
@@ -185,13 +165,53 @@ def main(config_path: str) -> int:
                     logging.warning("Could not determine battery level for %s: %s", ha_mqtt_id, str(e))
             else:
                 publish_state(client, mqtt_availability_topic, "offline")
-            client.loop_stop()
-            client.disconnect()
 
-        last_update_time = current_time
-        save_last_update_time(last_update_time)
+        state["last_update_time"] = time.time()
+        save_last_update_time(state["last_update_time"])
 
-    client.disconnect()
+    def on_message(client, userdata, msg):
+        # Home Assistant publishes "online" to this topic every time it
+        # finishes starting up (its MQTT "birth message"). Our attributes/
+        # availability/battery topics aren't retained, so without this,
+        # entities would sit "unavailable" after every HA restart until
+        # our next scheduled poll (up to polling_interval away). Listening
+        # for the birth message lets us push a *fresh* fetch immediately
+        # instead of waiting -- and instead of just replaying stale
+        # retained data, which would hide a genuinely dead bridge.
+        if msg.topic == "homeassistant/status" and msg.payload.decode() == "online":
+            logging.info("Home Assistant just came back online -- resyncing immediately")
+            publish_all_discovery(client)
+            poll_and_publish(client)
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.username_pw_set(mqtt_username, mqtt_password)
+
+    # One persistent connection for the life of the process, rather than
+    # reconnecting every cycle -- needed so we can stay subscribed to
+    # homeassistant/status and react the moment HA restarts.
+    client.connect(mqtt_broker, mqtt_port, 60)
+    client.loop_start()
+    client.subscribe("homeassistant/status")
+
+    # Publish retained MQTT discovery configs once at startup so Home
+    # Assistant creates/updates the entities automatically -- no
+    # configuration.yaml edits needed on the HA side.
+    publish_all_discovery(client)
+
+    try:
+        while True:
+            current_time = time.time()
+            sleep_time = max(0, polling_interval - (current_time - state["last_update_time"]))
+
+            logging.info("Sleeping for %d seconds", sleep_time)
+            time.sleep(sleep_time)
+
+            poll_and_publish(client)
+    finally:
+        client.loop_stop()
+        client.disconnect()
 
     return 0
 
