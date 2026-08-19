@@ -4,12 +4,14 @@ import yaml
 import json
 import argparse
 import threading
+import asyncio
 from pathlib import Path
 import time
 import paho.mqtt.client as mqtt
 from _login import get_account_sync
 from findmy import FindMyAccessory
 from findmy.reports import RemoteAnisetteProvider
+from findmy.scanner import OfflineFindingScanner
 from datetime import datetime, timedelta, timezone
 
 logging.basicConfig(level=logging.DEBUG)
@@ -28,26 +30,43 @@ def get_battery_level(status: int) -> str:
     battery_id = (status >> 6) & 0b11
     return BATTERY_LEVELS.get(battery_id, "Unknown")
 
-def get_location_report(plist_path: str, anisette_server: str):
-    try:
-        with Path(plist_path).open("rb") as f:
-            airtag = FindMyAccessory.from_plist(f)
+def load_accessories(airtags, config_dir):
+    # Loaded once at startup and reused for the life of the process -- both
+    # for cloud polling and for BLE matching. Reusing the same objects (vs.
+    # re-parsing the plist every cycle) matters for BLE: the findmy library
+    # tracks rolling-key alignment state on the accessory object itself via
+    # update_alignment(), which only helps if it's the *same* object across
+    # scans.
+    accessories = []
+    for airtag in airtags:
+        plist_path = config_dir / airtag["plist_path"]
+        ha_mqtt_id = airtag["ha_mqtt_id"]
+        name = airtag.get("name", ha_mqtt_id)
+        try:
+            with Path(plist_path).open("rb") as f:
+                accessory = FindMyAccessory.from_plist(f)
+            accessories.append({"ha_mqtt_id": ha_mqtt_id, "name": name, "accessory": accessory})
+        except Exception as e:
+            logging.error("Error loading accessory %s from %s: %s", ha_mqtt_id, plist_path, str(e))
+    return accessories
 
+def get_location_report(accessory, anisette_server: str):
+    try:
         anisette = RemoteAnisetteProvider(anisette_server)
         acc = get_account_sync(anisette)
 
         try:
-            report = acc.fetch_location(airtag)
+            report = acc.fetch_location(accessory)
         finally:
             acc._evt_loop.run_until_complete(acc.close())
 
         if report:
             return report
         else:
-            logging.warning("No location report found for %s", plist_path)
+            logging.warning("No location report found for accessory")
             return None
     except Exception as e:
-        logging.error("Error fetching location report for %s: %s", plist_path, str(e))
+        logging.error("Error fetching location report: %s", str(e))
         return None
 
 def publish_location(client, topic, report):
@@ -135,6 +154,90 @@ def on_connect(client, userdata, flags, reason_code, properties):
     else:
         logging.error("Failed to connect, return code %s", reason_code)
 
+async def _ble_scan_loop_async(client, accessories, home_latitude, home_longitude,
+                                ble_scan_interval, ble_scan_duration, unseen_threshold,
+                                stop_event):
+    # ha_mqtt_id -> last time we published a BLE-triggered "home" update.
+    # Used to avoid re-publishing on every single scan cycle while the tag
+    # just sits at home in range -- we only need to say "home" again once
+    # unseen_threshold has passed since the last time we said it.
+    last_published = {}
+
+    while not stop_event.is_set():
+        try:
+            scanner = await OfflineFindingScanner.create()
+            async for device in scanner.scan_for(timeout=ble_scan_duration):
+                now = time.time()
+                for entry in accessories:
+                    ha_mqtt_id = entry["ha_mqtt_id"]
+                    accessory = entry["accessory"]
+
+                    try:
+                        matched = device.is_from(accessory)
+                    except Exception as e:
+                        logging.warning("BLE match check failed for %s: %s", ha_mqtt_id, str(e))
+                        continue
+
+                    if not matched:
+                        continue
+
+                    if now - last_published.get(ha_mqtt_id, 0) < unseen_threshold:
+                        # Already told HA this one is home recently -- skip
+                        # the redundant publish.
+                        break
+
+                    logging.info(
+                        "BLE detected %s nearby (rssi=%s, battery=%s) -- publishing as home",
+                        ha_mqtt_id, device.rssi, device.battery_level,
+                    )
+
+                    location = {
+                        "latitude": home_latitude,
+                        "longitude": home_longitude,
+                        "gps_accuracy": 10,
+                        "last_report_time": device.detected_at,
+                        "broadcast_time": datetime.now(),
+                        "source": "ble",
+                    }
+                    client.publish(f"{ha_mqtt_id}/attributes", json.dumps(location, default=str))
+                    client.publish(f"{ha_mqtt_id}_gps/availability", "online")
+                    if device.battery_level and device.battery_level != "Unknown":
+                        client.publish(f"{ha_mqtt_id}/battery", device.battery_level)
+
+                    last_published[ha_mqtt_id] = now
+                    break
+        except Exception as e:
+            logging.error("BLE scan cycle failed: %s", str(e))
+
+        # Sleep between scan windows, but wake early (checked once a second)
+        # if we're shutting down.
+        slept = 0
+        while slept < ble_scan_interval and not stop_event.is_set():
+            await asyncio.sleep(1)
+            slept += 1
+
+def ble_scan_loop(client, accessories, home_latitude, home_longitude,
+                   ble_scan_interval, ble_scan_duration, unseen_threshold, stop_event):
+    # Runs in its own dedicated thread with its own asyncio event loop
+    # (BLE scanning via bleak/BlueZ is async-only). client.publish() is
+    # documented thread-safe to call from threads other than paho-mqtt's own
+    # network thread, so we can publish straight from here without routing
+    # through the main loop -- avoiding the earlier keepalive-starvation
+    # mistake, since this thread is entirely separate from the one running
+    # loop_start()'s network thread.
+    #
+    # Deliberately one-directional: seeing the AirTag over BLE means it's
+    # definitely home right now, so we publish immediately. NOT seeing it
+    # does NOT mean it's away (BLE range is short and detection is flaky) --
+    # "away" stays the responsibility of the existing cloud poll cycle.
+    try:
+        asyncio.run(_ble_scan_loop_async(
+            client, accessories, home_latitude, home_longitude,
+            ble_scan_interval, ble_scan_duration, unseen_threshold, stop_event,
+        ))
+    except Exception as e:
+        logging.error("BLE scan thread crashed: %s", str(e))
+
 def main(config_path: str) -> int:
     with open(config_path) as f:
         config = yaml.safe_load(f)
@@ -147,25 +250,35 @@ def main(config_path: str) -> int:
     polling_interval = config["polling_interval"] * 60
     airtags = config["airtags"]
 
+    # BLE-related settings. home_latitude/home_longitude are required for
+    # BLE to do anything useful (it needs somewhere to report as "home");
+    # if they're missing, BLE scanning is skipped entirely rather than
+    # publishing bogus 0,0 coordinates.
+    ble_scan_interval = config.get("ble_scan_interval", 40)
+    ble_scan_duration = config.get("ble_scan_duration", 20)
+    unseen_threshold = config.get("unseen_threshold", 60)
+    home_latitude = config.get("home_latitude")
+    home_longitude = config.get("home_longitude")
+
     config_dir = Path(config_path).parent
     state = {"last_update_time": load_last_update_time()}
 
+    accessories = load_accessories(airtags, config_dir)
+
     def publish_all_discovery(client):
-        for airtag in airtags:
-            ha_mqtt_id = airtag["ha_mqtt_id"]
-            name = airtag.get("name", ha_mqtt_id)
-            publish_discovery_config(client, ha_mqtt_id, name)
-            publish_battery_discovery_config(client, ha_mqtt_id, name)
+        for entry in accessories:
+            publish_discovery_config(client, entry["ha_mqtt_id"], entry["name"])
+            publish_battery_discovery_config(client, entry["ha_mqtt_id"], entry["name"])
 
     def poll_and_publish(client):
-        for airtag in airtags:
-            plist_path = config_dir / airtag["plist_path"]
-            ha_mqtt_id = airtag["ha_mqtt_id"]
+        for entry in accessories:
+            ha_mqtt_id = entry["ha_mqtt_id"]
+            accessory = entry["accessory"]
             mqtt_topic = f"{ha_mqtt_id}/attributes"
             mqtt_availability_topic = f"{ha_mqtt_id}_gps/availability"
             mqtt_battery_topic = f"{ha_mqtt_id}/battery"
 
-            report = get_location_report(plist_path, anisette_server)
+            report = get_location_report(accessory, anisette_server)
             if report:
                 publish_location(client, mqtt_topic, report)
                 publish_state(client, mqtt_availability_topic, "online")
@@ -222,6 +335,21 @@ def main(config_path: str) -> int:
     # configuration.yaml edits needed on the HA side.
     publish_all_discovery(client)
 
+    ble_stop_event = threading.Event()
+    ble_thread = None
+    if home_latitude is not None and home_longitude is not None:
+        ble_thread = threading.Thread(
+            target=ble_scan_loop,
+            args=(client, accessories, home_latitude, home_longitude,
+                  ble_scan_interval, ble_scan_duration, unseen_threshold, ble_stop_event),
+            daemon=True,
+            name="ble-scan",
+        )
+        ble_thread.start()
+        logging.info("BLE scan thread started (scan %ss every %ss)", ble_scan_duration, ble_scan_interval)
+    else:
+        logging.warning("home_latitude/home_longitude not set in config -- BLE scanning disabled")
+
     try:
         while True:
             current_time = time.time()
@@ -239,6 +367,7 @@ def main(config_path: str) -> int:
 
             poll_and_publish(client)
     finally:
+        ble_stop_event.set()
         client.loop_stop()
         client.disconnect()
 
