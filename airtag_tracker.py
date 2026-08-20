@@ -8,8 +8,9 @@ import asyncio
 from pathlib import Path
 import time
 import paho.mqtt.client as mqtt
-from _login import get_account_sync
+from _login import get_account_sync, SESSION_FILE
 from findmy import FindMyAccessory
+from findmy.errors import UnauthorizedError
 from findmy.reports import RemoteAnisetteProvider
 from findmy.scanner import OfflineFindingScanner
 from datetime import datetime, timedelta, timezone
@@ -65,6 +66,13 @@ def get_location_report(accessory, anisette_server: str):
         else:
             logging.warning("No location report found for accessory")
             return None
+    except UnauthorizedError:
+        # Apple has invalidated our saved session and wants a fresh 2FA
+        # login from a human -- no amount of retrying will fix this on its
+        # own. Let this propagate so the caller can stop hammering Apple's
+        # servers with repeated failed logins and raise a visible alert,
+        # instead of silently retrying every cycle like before.
+        raise
     except Exception as e:
         logging.error("Error fetching location report: %s", str(e))
         return None
@@ -137,6 +145,37 @@ def publish_battery_discovery_config(client, ha_mqtt_id, name):
     }
     client.publish(discovery_topic, json.dumps(payload), retain=True)
     logging.info("Published battery discovery config for %s to %s", ha_mqtt_id, discovery_topic)
+
+def publish_needs_login_discovery_config(client):
+    # A single diagnostic entity, separate from the per-AirTag devices, so
+    # a stuck "Apple wants a fresh 2FA login" state is visible in HA as its
+    # own alertable thing instead of just looking like generic AirTag
+    # "unavailable" (which could mean a dozen different benign things).
+    discovery_topic = "homeassistant/binary_sensor/airtag_bridge_needs_login/config"
+    payload = {
+        "name": "Needs Login",
+        "unique_id": "airtag_bridge_needs_login",
+        "object_id": "airtag_bridge_needs_login",
+        "state_topic": "airtag_bridge/needs_login",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "device_class": "problem",
+        "entity_category": "diagnostic",
+        "device": {
+            "identifiers": ["airtag_bridge"],
+            "name": "AirTag Bridge",
+        },
+    }
+    client.publish(discovery_topic, json.dumps(payload), retain=True)
+    logging.info("Published discovery config for AirTag Bridge needs-login sensor")
+
+def publish_needs_login_state(client, needs_login: bool):
+    # Retained (unlike the per-AirTag state topics) -- we deliberately want
+    # this to survive an HA restart and show up immediately via HA's own
+    # subscription to the retained message, without waiting on us to
+    # republish it.
+    client.publish("airtag_bridge/needs_login", "ON" if needs_login else "OFF", retain=True)
+    logging.info("Published needs-login state: %s", needs_login)
 
 def load_last_update_time():
     if Path(LAST_UPDATE_FILE).exists():
@@ -265,12 +304,46 @@ def main(config_path: str) -> int:
 
     accessories = load_accessories(airtags, config_dir)
 
+    # Tracks the "Apple wants a fresh human 2FA login" state. While flagged,
+    # poll_and_publish skips calling Apple's API entirely (cheap mtime check
+    # only) instead of retrying a doomed login every cycle -- see
+    # get_location_report's UnauthorizedError handling above for why.
+    needs_login_state = {"flag": False, "session_mtime_at_flag": None}
+
+    def session_file_mtime():
+        try:
+            return SESSION_FILE.stat().st_mtime
+        except FileNotFoundError:
+            return None
+
     def publish_all_discovery(client):
         for entry in accessories:
             publish_discovery_config(client, entry["ha_mqtt_id"], entry["name"])
             publish_battery_discovery_config(client, entry["ha_mqtt_id"], entry["name"])
+        publish_needs_login_discovery_config(client)
 
     def poll_and_publish(client):
+        if needs_login_state["flag"]:
+            if session_file_mtime() != needs_login_state["session_mtime_at_flag"]:
+                # account_session.json changed since we flagged the problem
+                # -- someone ran _login.py. Clear the flag and try again
+                # this cycle instead of waiting for the next one.
+                logging.info("account_session.json changed -- resuming normal polling")
+                needs_login_state["flag"] = False
+                publish_needs_login_state(client, False)
+            else:
+                logging.warning(
+                    "Skipping poll -- still waiting for a manual 2FA login "
+                    "(run `python /app/_login.py` in the container console). "
+                    "Not retrying against Apple until account_session.json changes."
+                )
+                for entry in accessories:
+                    publish_state(client, f'{entry["ha_mqtt_id"]}_gps/availability', "offline")
+                state["last_update_time"] = time.time()
+                save_last_update_time(state["last_update_time"])
+                return
+
+        hit_auth_failure = False
         for entry in accessories:
             ha_mqtt_id = entry["ha_mqtt_id"]
             accessory = entry["accessory"]
@@ -278,7 +351,17 @@ def main(config_path: str) -> int:
             mqtt_availability_topic = f"{ha_mqtt_id}_gps/availability"
             mqtt_battery_topic = f"{ha_mqtt_id}/battery"
 
-            report = get_location_report(accessory, anisette_server)
+            try:
+                report = get_location_report(accessory, anisette_server)
+            except UnauthorizedError:
+                logging.error(
+                    "Apple requires a fresh 2FA login for %s -- run "
+                    "`python /app/_login.py` in the container console.",
+                    ha_mqtt_id,
+                )
+                report = None
+                hit_auth_failure = True
+
             if report:
                 publish_location(client, mqtt_topic, report)
                 publish_state(client, mqtt_availability_topic, "online")
@@ -289,6 +372,11 @@ def main(config_path: str) -> int:
                     logging.warning("Could not determine battery level for %s: %s", ha_mqtt_id, str(e))
             else:
                 publish_state(client, mqtt_availability_topic, "offline")
+
+        if hit_auth_failure and not needs_login_state["flag"]:
+            needs_login_state["flag"] = True
+            needs_login_state["session_mtime_at_flag"] = session_file_mtime()
+            publish_needs_login_state(client, True)
 
         state["last_update_time"] = time.time()
         save_last_update_time(state["last_update_time"])
@@ -334,6 +422,10 @@ def main(config_path: str) -> int:
     # Assistant creates/updates the entities automatically -- no
     # configuration.yaml edits needed on the HA side.
     publish_all_discovery(client)
+    # Assume healthy at startup -- if we're wrong, the first poll cycle
+    # will flip this to ON within seconds anyway. Retained, so this is also
+    # what a first-ever deploy of this feature initializes to.
+    publish_needs_login_state(client, False)
 
     ble_stop_event = threading.Event()
     ble_thread = None
